@@ -4,6 +4,11 @@ import os
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
+try:  # использовать хранилище сертификатов Windows (помогает, если антивирус/прокси подменяет сертификаты)
+    import truststore
+    truststore.inject_into_ssl()
+except ImportError:
+    pass
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, ContextTypes,
