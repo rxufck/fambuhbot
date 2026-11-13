@@ -88,70 +88,93 @@ def money(x, sign=False):
 
 
 # ---------- БАЗА ДАННЫХ ----------
+# Если задана переменная DATABASE_URL — используется PostgreSQL (для хостинга), иначе локальный SQLite.
 class DB:
-    def __init__(self, path="budget.db"):
-        self.c = sqlite3.connect(path, check_same_thread=False)
-        self.c.executescript("""
-        CREATE TABLE IF NOT EXISTS chats(chat_id INTEGER PRIMARY KEY, start_balance REAL DEFAULT 0);
-        CREATE TABLE IF NOT EXISTS tx(id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER, user_name TEXT,
-            ts TEXT, amount REAL, category TEXT, note TEXT);
-        CREATE TABLE IF NOT EXISTS learned(chat_id INTEGER, note TEXT, category TEXT, PRIMARY KEY(chat_id, note));
-        """)
+    def __init__(self, path="budget.db", url=None):
+        self.url = url or None
+        self.path = path
+        self.pg = bool(self.url)
+        self._connect()
+        id_col = "BIGSERIAL PRIMARY KEY" if self.pg else "INTEGER PRIMARY KEY AUTOINCREMENT"
+        big = "BIGINT" if self.pg else "INTEGER"
+        real = "DOUBLE PRECISION" if self.pg else "REAL"
+        self._run(f"CREATE TABLE IF NOT EXISTS chats(chat_id {big} PRIMARY KEY, start_balance {real} DEFAULT 0)")
+        self._run(f"CREATE TABLE IF NOT EXISTS tx(id {id_col}, chat_id {big}, user_name TEXT, ts TEXT, "
+                  f"amount {real}, category TEXT, note TEXT)")
+        self._run(f"CREATE TABLE IF NOT EXISTS learned(chat_id {big}, note TEXT, category TEXT, "
+                  f"PRIMARY KEY(chat_id, note))")
+
+    def _connect(self):
+        if self.pg:
+            import psycopg
+            self.c = psycopg.connect(self.url, autocommit=True)
+        else:
+            self.c = sqlite3.connect(self.path, check_same_thread=False)
+
+    def _run(self, sql, params=(), fetch=None):
+        if self.pg:
+            sql = sql.replace("?", "%s")
+        for attempt in (0, 1):
+            try:
+                cur = self.c.execute(sql, params)
+                out = cur.fetchone() if fetch == "one" else cur.fetchall() if fetch == "all" else None
+                if not self.pg:
+                    self.c.commit()
+                return out
+            except Exception as e:
+                if self.pg and attempt == 0 and e.__class__.__name__ in ("OperationalError", "InterfaceError"):
+                    self._connect()  # соединение с БД оборвалось — переподключаемся
+                    continue
+                raise
 
     def register(self, chat_id):
-        self.c.execute("INSERT OR IGNORE INTO chats(chat_id) VALUES(?)", (chat_id,))
-        self.c.commit()
+        self._run("INSERT INTO chats(chat_id) VALUES(?) ON CONFLICT DO NOTHING", (chat_id,))
 
     def chats(self):
-        return [r[0] for r in self.c.execute("SELECT chat_id FROM chats")]
+        return [r[0] for r in self._run("SELECT chat_id FROM chats", fetch="all")]
 
     def set_start(self, chat_id, amount):
         self.register(chat_id)
-        self.c.execute("UPDATE chats SET start_balance=? WHERE chat_id=?", (amount, chat_id))
-        self.c.commit()
+        self._run("UPDATE chats SET start_balance=? WHERE chat_id=?", (amount, chat_id))
 
     def balance(self, chat_id):
         self.register(chat_id)
-        s = self.c.execute("SELECT start_balance FROM chats WHERE chat_id=?", (chat_id,)).fetchone()[0]
-        t = self.c.execute("SELECT COALESCE(SUM(amount),0) FROM tx WHERE chat_id=?", (chat_id,)).fetchone()[0]
+        s = self._run("SELECT start_balance FROM chats WHERE chat_id=?", (chat_id,), "one")[0]
+        t = self._run("SELECT COALESCE(SUM(amount),0) FROM tx WHERE chat_id=?", (chat_id,), "one")[0]
         return s + t
 
     def add(self, chat_id, user, amount, category, note, ts=None):
         self.register(chat_id)
         ts = ts or datetime.now().isoformat(timespec="seconds")
-        cur = self.c.execute("INSERT INTO tx(chat_id,user_name,ts,amount,category,note) VALUES(?,?,?,?,?,?)",
-                             (chat_id, user, ts, amount, category, note))
-        self.c.commit()
-        return cur.lastrowid
+        return self._run("INSERT INTO tx(chat_id,user_name,ts,amount,category,note) VALUES(?,?,?,?,?,?) RETURNING id",
+                         (chat_id, user, ts, amount, category, note), "one")[0]
 
     def set_category(self, chat_id, tx_id, category):
-        self.c.execute("UPDATE tx SET category=? WHERE id=? AND chat_id=?", (category, tx_id, chat_id))
-        self.c.commit()
+        self._run("UPDATE tx SET category=? WHERE id=? AND chat_id=?", (category, tx_id, chat_id))
 
     def get(self, chat_id, tx_id):
-        return self.c.execute("SELECT id,user_name,ts,amount,category,note FROM tx WHERE id=? AND chat_id=?",
-                              (tx_id, chat_id)).fetchone()
+        return self._run("SELECT id,user_name,ts,amount,category,note FROM tx WHERE id=? AND chat_id=?",
+                         (tx_id, chat_id), "one")
 
     def delete(self, chat_id, tx_id=None):
         if tx_id is None:
-            r = self.c.execute("SELECT id FROM tx WHERE chat_id=? ORDER BY id DESC LIMIT 1", (chat_id,)).fetchone()
+            r = self._run("SELECT id FROM tx WHERE chat_id=? ORDER BY id DESC LIMIT 1", (chat_id,), "one")
             if not r:
                 return None
             tx_id = r[0]
         row = self.get(chat_id, tx_id)
         if row:
-            self.c.execute("DELETE FROM tx WHERE id=?", (tx_id,))
-            self.c.commit()
+            self._run("DELETE FROM tx WHERE id=?", (tx_id,))
         return row
 
     def recent(self, chat_id, n=10):
-        return self.c.execute("SELECT id,user_name,ts,amount,category,note FROM tx WHERE chat_id=? "
-                              "ORDER BY id DESC LIMIT ?", (chat_id, n)).fetchall()
+        return self._run("SELECT id,user_name,ts,amount,category,note FROM tx WHERE chat_id=? "
+                         "ORDER BY id DESC LIMIT ?", (chat_id, n), "all")
 
     def month(self, chat_id, year, month):
         ym = f"{year:04d}-{month:02d}"
-        rows = self.c.execute("SELECT COALESCE(category,'Без категории'), amount FROM tx "
-                              "WHERE chat_id=? AND substr(ts,1,7)=?", (chat_id, ym)).fetchall()
+        rows = self._run("SELECT COALESCE(category,'Без категории'), amount FROM tx "
+                         "WHERE chat_id=? AND substr(ts,1,7)=?", (chat_id, ym), "all")
         exp, inc = {}, {}
         for cat, a in rows:
             d = inc if a > 0 else exp
@@ -160,11 +183,12 @@ class DB:
 
     def learn(self, chat_id, note, category):
         if note:
-            self.c.execute("INSERT OR REPLACE INTO learned VALUES(?,?,?)", (chat_id, note.lower().strip(), category))
-            self.c.commit()
+            self._run("INSERT INTO learned(chat_id,note,category) VALUES(?,?,?) "
+                      "ON CONFLICT(chat_id,note) DO UPDATE SET category=excluded.category",
+                      (chat_id, note.lower().strip(), category))
 
     def learned(self, chat_id):
-        return dict(self.c.execute("SELECT note, category FROM learned WHERE chat_id=?", (chat_id,)).fetchall())
+        return dict(self._run("SELECT note, category FROM learned WHERE chat_id=?", (chat_id,), "all"))
 
 
 MONTHS = ["", "январь", "февраль", "март", "апрель", "май", "июнь", "июль", "август", "сентябрь", "октябрь",

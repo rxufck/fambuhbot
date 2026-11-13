@@ -1,4 +1,5 @@
 """Telegram-бот семейного бюджета. Запуск: python bot.py (токен в файле .env)."""
+import hashlib
 import logging
 import os
 from datetime import datetime, time, timedelta
@@ -21,7 +22,7 @@ TOKEN = os.environ["BOT_TOKEN"]
 TZ = ZoneInfo(os.getenv("TIMEZONE", "Europe/Moscow"))
 SUMMARY_HOUR = int(os.getenv("SUMMARY_HOUR", "21"))
 ALLOWED = {int(x) for x in os.getenv("ALLOWED_USER_IDS", "").replace(" ", "").split(",") if x}
-db = DB(os.getenv("DB_PATH", "budget.db"))
+db = DB(os.getenv("DB_PATH", "budget.db"), os.getenv("DATABASE_URL"))
 EXP_CATS = list(EXPENSE)
 logging.basicConfig(level=logging.INFO)
 
@@ -227,8 +228,17 @@ def main():
         app.add_handler(CommandHandler(name, fn))
     app.add_handler(CallbackQueryHandler(pick_category, pattern=r"^c:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text))
-    app.job_queue.run_daily(monthly, time=time(SUMMARY_HOUR, 0, tzinfo=TZ))
-    app.run_polling()
+    base = os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL")
+    if base:
+        # Режим хостинга: Telegram сам присылает сообщения на адрес сервиса (webhook).
+        # Сводку в конце месяца в этом режиме шлёт GitHub Actions (summary.py).
+        secret = hashlib.sha256(TOKEN.encode()).hexdigest()
+        app.run_webhook(listen="0.0.0.0", port=int(os.getenv("PORT", "8080")), url_path=secret[:32],
+                        webhook_url=f"{base.rstrip('/')}/{secret[:32]}", secret_token=secret[32:],
+                        allowed_updates=Update.ALL_TYPES)
+    else:
+        app.job_queue.run_daily(monthly, time=time(SUMMARY_HOUR, 0, tzinfo=TZ))
+        app.run_polling()
 
 
 if __name__ == "__main__":
